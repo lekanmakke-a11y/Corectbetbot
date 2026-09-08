@@ -1,23 +1,27 @@
 import os
 import logging
 import sys
-import asyncio
+import time
 from dotenv import load_dotenv
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import Application, CommandHandler, CallbackQueryHandler, ContextTypes
-from telegram.error import TelegramError, BadRequest
+from telegram.error import TelegramError, BadRequest, NetworkError, TimedOut
 
 # Load environment variables
 load_dotenv()
 
-# Configure logging
+# Configure logging with file and console output
 logging.basicConfig(
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
-    level=logging.INFO
+    level=logging.INFO,
+    handlers=[
+        logging.StreamHandler(sys.stdout),
+        logging.FileHandler('bot.log')
+    ]
 )
 logger = logging.getLogger(__name__)
 
-# Get environment variables
+# Get environment variables with fallbacks
 BOT_TOKEN = os.getenv('BOT_TOKEN')
 CHANNEL_ID = os.getenv('CHANNEL_ID')
 CHANNEL_LINK = os.getenv('CHANNEL_LINK', 'https://t.me/+QvCFEopP3r9hY2Q0')
@@ -31,6 +35,13 @@ if not BOT_TOKEN:
 
 if not CHANNEL_ID:
     logger.error("CHANNEL_ID not found in environment variables")
+    sys.exit(1)
+
+# Convert CHANNEL_ID to integer with error handling
+try:
+    CHANNEL_ID_INT = int(CHANNEL_ID)
+except ValueError:
+    logger.error(f"Invalid CHANNEL_ID format: {CHANNEL_ID}. Must be a number.")
     sys.exit(1)
 
 # Constants
@@ -83,6 +94,10 @@ def get_access_confirmed_keyboard():
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handle the /start command"""
     try:
+        if not update or not update.effective_user:
+            logger.warning("Received start command with no user")
+            return
+            
         user = update.effective_user
         logger.info(f"User {user.id} (@{user.username}) started the bot")
         
@@ -103,95 +118,150 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def check_membership(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Check if user has joined the channel"""
-    query = update.callback_query
-    user_id = query.from_user.id
-    
     try:
-        await query.answer()
+        if not update or not update.callback_query:
+            logger.warning("Received callback with no query")
+            return
+            
+        query = update.callback_query
+        user_id = query.from_user.id
+        
+        # Always answer callback query first to prevent timeout
+        try:
+            await query.answer()
+        except Exception as e:
+            logger.warning(f"Could not answer callback: {e}")
+        
         logger.info(f"Checking membership for user {user_id}")
         
-        # Convert channel ID to integer
-        try:
-            chat_id = int(CHANNEL_ID)
-        except ValueError:
-            logger.error(f"Invalid CHANNEL_ID format: {CHANNEL_ID}")
-            await query.edit_message_text(
-                "❌ **Eroare de configurare.**\n\nID-ul canalului este invalid.",
-                parse_mode='Markdown'
-            )
-            return
-        
-        # Get chat member status
-        try:
-            member = await context.bot.get_chat_member(chat_id=chat_id, user_id=user_id)
-            status = member.status
-            logger.info(f"User {user_id} membership status: {status}")
-            
-            if status in ['member', 'administrator', 'creator']:
-                # User is a member
-                await query.edit_message_text(
-                    ACCESS_CONFIRMED,
-                    reply_markup=get_access_confirmed_keyboard(),
-                    parse_mode='Markdown'
-                )
-                logger.info(f"User {user_id} successfully verified")
-            else:
-                # User is not a member
-                await query.edit_message_text(
-                    NOT_JOINED_MESSAGE,
-                    reply_markup=get_check_keyboard(),
-                    parse_mode='Markdown'
-                )
-                logger.info(f"User {user_id} not a member")
-                
-        except BadRequest as e:
-            logger.error(f"BadRequest for user {user_id}: {str(e)}")
-            if "chat not found" in str(e).lower():
-                error_msg = "❌ **Canalul nu a fost găsit.**\n\nVerifică dacă botul este administrator în canal."
-            elif "bot is not a member" in str(e).lower():
-                error_msg = "❌ **Botul nu este administrator în canal.**\n\nTe rugăm să contactezi suportul."
-            elif "user not found" in str(e).lower():
-                error_msg = "❌ **Nu te-am putut găsi.**\n\nTe rugăm să încerci din nou."
-            else:
-                error_msg = f"❌ **Eroare:** {str(e)}"
-            
-            await query.edit_message_text(
-                error_msg,
-                reply_markup=get_check_keyboard(),
-                parse_mode='Markdown'
-            )
-            
-        except TelegramError as e:
-            logger.error(f"TelegramError for user {user_id}: {str(e)}")
-            await query.edit_message_text(
-                ERROR_MESSAGE,
-                reply_markup=get_check_keyboard(),
-                parse_mode='Markdown'
-            )
-            
-    except Exception as e:
-        logger.error(f"Unexpected error checking membership for user {user_id}: {str(e)}")
-        try:
-            await query.edit_message_text(
-                ERROR_MESSAGE,
-                reply_markup=get_check_keyboard(),
-                parse_mode='Markdown'
-            )
-        except:
+        # Get chat member status with retry
+        max_retries = 3
+        for attempt in range(max_retries):
             try:
-                await query.message.reply_text(
+                member = await context.bot.get_chat_member(chat_id=CHANNEL_ID_INT, user_id=user_id)
+                status = member.status
+                logger.info(f"User {user_id} membership status: {status}")
+                
+                if status in ['member', 'administrator', 'creator']:
+                    # User is a member
+                    try:
+                        await query.edit_message_text(
+                            ACCESS_CONFIRMED,
+                            reply_markup=get_access_confirmed_keyboard(),
+                            parse_mode='Markdown'
+                        )
+                    except Exception as e:
+                        logger.error(f"Error editing message: {e}")
+                        await query.message.reply_text(
+                            ACCESS_CONFIRMED,
+                            reply_markup=get_access_confirmed_keyboard(),
+                            parse_mode='Markdown'
+                        )
+                    logger.info(f"User {user_id} successfully verified")
+                    return
+                else:
+                    # User is not a member
+                    try:
+                        await query.edit_message_text(
+                            NOT_JOINED_MESSAGE,
+                            reply_markup=get_check_keyboard(),
+                            parse_mode='Markdown'
+                        )
+                    except Exception as e:
+                        logger.error(f"Error editing message: {e}")
+                        await query.message.reply_text(
+                            NOT_JOINED_MESSAGE,
+                            reply_markup=get_check_keyboard(),
+                            parse_mode='Markdown'
+                        )
+                    logger.info(f"User {user_id} not a member")
+                    return
+                    
+            except BadRequest as e:
+                logger.error(f"BadRequest for user {user_id} (attempt {attempt+1}): {str(e)}")
+                
+                if "chat not found" in str(e).lower():
+                    error_msg = "❌ **Canalul nu a fost găsit.**\n\nVerifică dacă botul este administrator în canal."
+                elif "bot is not a member" in str(e).lower():
+                    error_msg = "❌ **Botul nu este administrator în canal.**\n\nTe rugăm să contactezi suportul."
+                elif "user not found" in str(e).lower():
+                    error_msg = "❌ **Nu te-am putut găsi.**\n\nTe rugăm să încerci din nou."
+                elif "too many requests" in str(e).lower():
+                    error_msg = "⏳ **Prea multe cereri.**\n\nTe rugăm să aștepți câteva secunde."
+                    if attempt < max_retries - 1:
+                        await asyncio.sleep(2)
+                        continue
+                else:
+                    error_msg = f"❌ **Eroare:** {str(e)[:100]}"
+                
+                try:
+                    await query.edit_message_text(
+                        error_msg,
+                        reply_markup=get_check_keyboard(),
+                        parse_mode='Markdown'
+                    )
+                except:
+                    await query.message.reply_text(
+                        error_msg,
+                        reply_markup=get_check_keyboard(),
+                        parse_mode='Markdown'
+                    )
+                return
+                
+            except (NetworkError, TimedOut) as e:
+                logger.error(f"Network error for user {user_id} (attempt {attempt+1}): {str(e)}")
+                if attempt < max_retries - 1:
+                    await asyncio.sleep(2)
+                    continue
+                else:
+                    error_msg = "⚠️ **Eroare de conexiune.**\n\nTe rugăm să încerci din nou."
+                    try:
+                        await query.edit_message_text(
+                            error_msg,
+                            reply_markup=get_check_keyboard(),
+                            parse_mode='Markdown'
+                        )
+                    except:
+                        await query.message.reply_text(
+                            error_msg,
+                            reply_markup=get_check_keyboard(),
+                            parse_mode='Markdown'
+                        )
+                    return
+                    
+            except TelegramError as e:
+                logger.error(f"TelegramError for user {user_id}: {str(e)}")
+                try:
+                    await query.edit_message_text(
+                        ERROR_MESSAGE,
+                        reply_markup=get_check_keyboard(),
+                        parse_mode='Markdown'
+                    )
+                except:
+                    await query.message.reply_text(
+                        ERROR_MESSAGE,
+                        reply_markup=get_check_keyboard(),
+                        parse_mode='Markdown'
+                    )
+                return
+                
+    except Exception as e:
+        logger.error(f"Unexpected error in check_membership: {str(e)}")
+        try:
+            if update and update.callback_query:
+                await update.callback_query.message.reply_text(
                     ERROR_MESSAGE,
                     parse_mode='Markdown'
                 )
-            except:
-                pass
+        except:
+            pass
 
 async def handle_start_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handle the start callback to reset the flow"""
-    query = update.callback_query
-    await query.answer()
-    
     try:
+        query = update.callback_query
+        await query.answer()
+        
         await query.edit_message_text(
             WELCOME_MESSAGE,
             reply_markup=get_verify_keyboard(),
@@ -200,7 +270,7 @@ async def handle_start_callback(update: Update, context: ContextTypes.DEFAULT_TY
     except Exception as e:
         logger.error(f"Error in start callback: {str(e)}")
         try:
-            await query.message.reply_text(
+            await update.callback_query.message.reply_text(
                 "❌ A apărut o eroare. Te rugăm să încerci din nou.",
                 parse_mode='Markdown'
             )
@@ -209,7 +279,7 @@ async def handle_start_callback(update: Update, context: ContextTypes.DEFAULT_TY
 
 async def error_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handle errors"""
-    logger.error(f"Update {update} caused error {context.error}")
+    logger.error(f"Update {update} caused error: {context.error}")
     
     try:
         if update and update.effective_message:
@@ -219,6 +289,22 @@ async def error_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
     except Exception as e:
         logger.error(f"Error in error handler: {str(e)}")
+
+async def post_init(application):
+    """Called after the application is initialized"""
+    logger.info("Bot started successfully!")
+    logger.info(f"Bot Username: @{application.bot.username}")
+    logger.info(f"Channel ID: {CHANNEL_ID_INT}")
+    logger.info(f"Channel Link: {CHANNEL_LINK}")
+    
+    # Test connection to channel
+    try:
+        chat = await application.bot.get_chat(chat_id=CHANNEL_ID_INT)
+        logger.info(f"Connected to channel: {chat.title}")
+        logger.info("Bot is ready to accept messages!")
+    except Exception as e:
+        logger.error(f"Could not connect to channel: {str(e)}")
+        logger.warning("Bot will still work but channel verification may fail")
 
 def main():
     """Start the bot"""
@@ -234,13 +320,15 @@ def main():
         # Add error handler
         application.add_error_handler(error_handler)
         
+        # Add post initialization
+        application.post_init = post_init
+        
         # Start the bot
         if WEBHOOK_URL:
             # Webhook mode (for Railway)
             logger.info(f"Starting bot in webhook mode on port {PORT}")
             logger.info(f"Webhook URL: {WEBHOOK_URL}/{BOT_TOKEN}")
             
-            # Set webhook
             application.run_webhook(
                 listen="0.0.0.0",
                 port=PORT,
@@ -252,12 +340,17 @@ def main():
             logger.info("Starting bot in polling mode")
             application.run_polling(
                 allowed_updates=Update.ALL_TYPES,
-                drop_pending_updates=True
+                drop_pending_updates=True,
+                poll_interval=1.0
             )
             
     except Exception as e:
         logger.error(f"Fatal error: {str(e)}")
+        logger.info("Bot will restart in 5 seconds...")
+        time.sleep(5)
         sys.exit(1)
 
 if __name__ == '__main__':
+    # Add asyncio import for sleep
+    import asyncio
     main()
